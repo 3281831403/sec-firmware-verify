@@ -38,6 +38,30 @@ CANONICAL_FIELDS = ("version", "image_hash", "parent_hash")
 HASH_HEX_LEN = 64
 MIN_TRUSTED_VERSION = 1
 
+# Fixed-width sentinel used so a malformed candidate still goes through the
+# single constant-time comparison instead of triggering an early return.
+_BAD_SIGNATURE_HEX = "0" * HASH_HEX_LEN
+_HASH_CHUNK_SIZE = 64 * 1024
+
+
+def _is_int(value):
+    """True only for genuine integers (``bool`` is explicitly excluded)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_hex(value):
+    """True when every character of ``value`` is a hexadecimal digit."""
+    try:
+        int(value, 16)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _is_valid_hash_hex(value):
+    """True for a 64-character hex string (case-insensitive input)."""
+    return isinstance(value, str) and len(value) == HASH_HEX_LEN and _is_hex(value)
+
 
 def parse_manifest(blob):
     """Parse and normalize a firmware manifest.
@@ -60,7 +84,60 @@ def parse_manifest(blob):
     reported, never defaulted to 0, because 0 would let an old image claim to
     be a legal upgrade.
     """
-    raise NotImplementedError
+    if isinstance(blob, str):
+        raw = blob
+    elif isinstance(blob, (bytes, bytearray)):
+        raw = bytes(blob).decode("utf-8")
+    else:
+        raise ValueError("manifest blob must be str or bytes")
+
+    try:
+        document = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("malformed manifest JSON") from exc
+
+    if not isinstance(document, dict):
+        raise ValueError("manifest must be a JSON object")
+
+    # Defect 1: a missing version is an error, never an implicit zero that an
+    # old image could use to pose as a fresh upgrade.
+    if "version" not in document:
+        raise ValueError("missing required field: version")
+
+    version = document["version"]
+    if _is_int(version):
+        normalized_version = version
+    elif isinstance(version, str) and version.strip().lstrip("-").isdigit():
+        normalized_version = int(version.strip())
+    else:
+        # bools, floats, None and non-decimal strings are unusable versions.
+        raise ValueError("version must be an integer >= 1")
+    if normalized_version < MIN_TRUSTED_VERSION:
+        raise ValueError("version must be >= 1")
+
+    for field in ("image_hash", "signature"):
+        if field not in document:
+            raise ValueError(f"missing required field: {field}")
+        if not _is_valid_hash_hex(document[field]):
+            raise ValueError(f"{field} must be a 64-char hex string")
+
+    if "parent_hash" not in document:
+        raise ValueError("missing required field: parent_hash")
+    parent_hash = document["parent_hash"]
+    if parent_hash is None or parent_hash == "":
+        normalized_parent = None
+    elif _is_valid_hash_hex(parent_hash):
+        normalized_parent = parent_hash.lower()
+    else:
+        raise ValueError("parent_hash must be None, '' or a 64-char hex string")
+
+    # Build a fresh dict so the caller's document is never mutated.
+    normalized = dict(document)
+    normalized["version"] = normalized_version
+    normalized["image_hash"] = document["image_hash"].lower()
+    normalized["signature"] = document["signature"].lower()
+    normalized["parent_hash"] = normalized_parent
+    return normalized
 
 
 def hash_image(image):
@@ -73,7 +150,13 @@ def hash_image(image):
     Python's builtin ``hash()`` (which is salted per process and is not a
     cryptographic collision-resistant function).
     """
-    raise NotImplementedError
+    # Defect 2: SHA-256 from hashlib, streamed in chunks -- reproducible,
+    # collision-resistant, independent of PYTHONHASHSEED and image length.
+    digest = hashlib.sha256()
+    view = memoryview(image)
+    for offset in range(0, len(view), _HASH_CHUNK_SIZE):
+        digest.update(view[offset:offset + _HASH_CHUNK_SIZE])
+    return digest.hexdigest()
 
 
 def verify_signature(manifest, key, sig):
@@ -95,7 +178,30 @@ def verify_signature(manifest, key, sig):
     comparison and then return ``False``.  Missing manifest fields or wrong
     argument types also return ``False`` instead of raising.
     """
-    raise NotImplementedError
+    try:
+        # Defects 3 & 4: no "==", no length-based early return.  Every path
+        # funnels into exactly one hmac.compare_digest call on equal-length
+        # hex strings, so no length information leaks via control flow.
+        payload = {field: manifest[field] for field in CANONICAL_FIELDS}
+        signed = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        expected = hmac.new(key, signed, hashlib.sha256).hexdigest()
+
+        if isinstance(sig, str) and _is_valid_hash_hex(sig):
+            candidate = sig.lower()
+        elif isinstance(sig, (bytes, bytearray)) and len(sig) == hashlib.sha256().digest_size:
+            candidate = bytes(sig).hex()
+        else:
+            # Truncated/wrong-typed candidate: pad out to the fixed width and
+            # let the single constant-time comparison reject it.
+            candidate = _BAD_SIGNATURE_HEX
+
+        return hmac.compare_digest(candidate, expected)
+    except (TypeError, ValueError, KeyError, AttributeError):
+        # Malformed manifest, bad key type, missing fields: verification
+        # failure, never an exception.
+        return False
 
 
 def verify_chain(manifests):
@@ -111,7 +217,26 @@ def verify_chain(manifests):
     chain returns ``[]``.  A first entry that is not genesis is reported as
     ``"index=0"``.
     """
-    raise NotImplementedError
+    # Defect 5: walk the whole chain and collect every broken link instead of
+    # checking a single pair, so a splice in the middle cannot slip through.
+    problems = []
+    if not manifests:
+        return problems
+
+    first_parent = manifests[0].get("parent_hash")
+    if first_parent is not None and first_parent != "":
+        problems.append("index=0")
+
+    for index in range(1, len(manifests)):
+        parent_hash = manifests[index].get("parent_hash")
+        previous_image_hash = manifests[index - 1].get("image_hash")
+        if (
+            not isinstance(parent_hash, str)
+            or not isinstance(previous_image_hash, str)
+            or parent_hash.lower() != previous_image_hash.lower()
+        ):
+            problems.append(f"index={index}")
+    return problems
 
 
 def anti_rollback(version, min_version):
@@ -127,7 +252,15 @@ def anti_rollback(version, min_version):
     older version also returns ``False``.  Only ``version > min_version`` is
     acceptable.
     """
-    raise NotImplementedError
+    if not _is_int(min_version) or min_version < MIN_TRUSTED_VERSION:
+        # Defect 7: an untrusted/zero/negative floor is rejected outright
+        # instead of silently turning rollback protection off.
+        raise ValueError("min_version must be a trusted integer >= 1")
+    if not _is_int(version):
+        raise ValueError("version must be an integer")
+
+    # Defect 6: strictly greater -- an equal version is a replay, not progress.
+    return version > min_version
 
 
 def validate_manifest(manifest):
@@ -152,7 +285,43 @@ def validate_manifest(manifest):
     not enough.  This function checks structure only; it does not verify the
     HMAC.
     """
-    raise NotImplementedError
+    problems = []
+    if not isinstance(manifest, dict):
+        return ["manifest:not-dict"]
+
+    required = ("version", "image_hash", "signature", "parent_hash")
+    for field in required:
+        if field not in manifest:
+            problems.append(f"missing:{field}")
+
+    if "version" in manifest:
+        if not _is_int(manifest["version"]):
+            problems.append("version:not-int")
+        elif manifest["version"] < MIN_TRUSTED_VERSION:
+            problems.append("version:out-of-range")
+
+    for field in ("image_hash", "signature"):
+        if field not in manifest:
+            continue
+        value = manifest[field]
+        prefix = field
+        if not isinstance(value, str):
+            problems.append(f"{prefix}:not-str")
+            continue
+        # Defect 9: enforce the exact digest length, so a truncated hash made
+        # of valid hex characters is still rejected.
+        if len(value) != HASH_HEX_LEN:
+            problems.append(f"{prefix}:bad-length")
+        if not _is_hex(value):
+            problems.append(f"{prefix}:not-hex")
+
+    if "parent_hash" in manifest:
+        parent_hash = manifest["parent_hash"]
+        if parent_hash is not None and parent_hash != "":
+            if not _is_valid_hash_hex(parent_hash):
+                problems.append("parent_hash:bad")
+
+    return problems
 
 
 def verify_image(manifest, image, key):
@@ -178,7 +347,60 @@ def verify_image(manifest, image, key):
     ``"version:invalid"``.  Malformed input produces a result dict with
     ``ok`` false; it does not raise.
     """
-    raise NotImplementedError
+    result = {
+        "ok": False,
+        "hash_ok": False,
+        "signature_ok": False,
+        "version_ok": False,
+        "version": None,
+        "image_hash": None,
+        "errors": [],
+    }
+
+    try:
+        structural_problems = validate_manifest(manifest)
+        if structural_problems:
+            result["errors"].append("manifest:invalid")
+
+        image_hash = manifest.get("image_hash") if isinstance(manifest, dict) else None
+        if isinstance(image_hash, str):
+            result["image_hash"] = image_hash
+            # Defect 8: the hash is always computed and compared, even if the
+            # signature check fails; a bad hash can never be masked.
+            result["hash_ok"] = hmac.compare_digest(
+                hash_image(image), image_hash.lower()
+            )
+        if not result["hash_ok"]:
+            result["errors"].append("image_hash:mismatch")
+
+        signature = manifest.get("signature") if isinstance(manifest, dict) else None
+        result["signature_ok"] = verify_signature(manifest, key, signature)
+        if not result["signature_ok"]:
+            result["errors"].append("signature:invalid")
+
+        version = manifest.get("version") if isinstance(manifest, dict) else None
+        if _is_int(version) and version >= MIN_TRUSTED_VERSION:
+            result["version_ok"] = True
+            result["version"] = version
+        else:
+            result["errors"].append("version:invalid")
+
+        result["ok"] = (
+            result["hash_ok"]
+            and result["signature_ok"]
+            and result["version_ok"]
+        )
+    except (TypeError, ValueError, KeyError, AttributeError):
+        # Any malformed input collapses into a failed result dict.
+        result["ok"] = False
+    return result
+
+
+def _validate_trusted_floor(floor):
+    """Shared guard for floors that originate in trusted policy."""
+    if not _is_int(floor) or floor < MIN_TRUSTED_VERSION:
+        raise ValueError("min_version must be a trusted integer >= 1")
+    return floor
 
 
 def fw_batch(updates, config):
@@ -210,4 +432,48 @@ def fw_batch(updates, config):
     raises ``ValueError``; a malformed per-update floor makes only that entry
     fail with ``"min_version:invalid"``.
     """
-    raise NotImplementedError
+    config_floor = _validate_trusted_floor(config.get("min_version"))
+    key = config.get("key")
+
+    results = []
+    failed = []
+
+    for index, update in enumerate(updates):
+        manifest = update.get("manifest")
+        image = update.get("image")
+
+        # Defect 10: derive the effective floor afresh for every update from
+        # the trusted config value; no state is carried over from a previous
+        # update's threshold.
+        if "min_version" in update:
+            floor = update["min_version"]
+            if not _is_int(floor) or floor < MIN_TRUSTED_VERSION:
+                result = verify_image(manifest, image, key)
+                result["ok"] = False
+                result["errors"].append("min_version:invalid")
+                results.append(result)
+                failed.append(index)
+                continue
+        else:
+            floor = config_floor
+
+        result = verify_image(manifest, image, key)
+
+        version = result["version"]
+        if version is not None:
+            try:
+                if not anti_rollback(version, floor):
+                    result["version_ok"] = False
+                    result["ok"] = False
+                    result["errors"].append("version:below-floor")
+            except ValueError:
+                result["ok"] = False
+                result["errors"].append("version:below-floor")
+        else:
+            result["ok"] = False
+
+        if not result["ok"]:
+            failed.append(index)
+        results.append(result)
+
+    return {"ok": not failed, "results": results, "failed": failed}
